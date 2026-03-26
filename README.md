@@ -8,6 +8,8 @@ pip install torch==1.7.1+cu110 torchvision==0.8.2+cu110 torchaudio==0.7.2   -f h
 
 wget https://github.com/szc19990412/TransMIL/archive/refs/heads/main.zip
 
+unzip main.zip
+
 pip install -r requirements.txt
 
 python -m pip install pytorch-toolbelt
