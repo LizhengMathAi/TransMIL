@@ -25,7 +25,7 @@ class  ModelInterface(pl.LightningModule):
     #---->init
     def __init__(self, model, loss, optimizer, **kargs):
         super(ModelInterface, self).__init__()
-        self.save_hyperparameters()
+        self.model_cfg = model
         self.load_model()
         self.loss = create_loss(loss)
         self.optimizer = optimizer
@@ -37,29 +37,20 @@ class  ModelInterface(pl.LightningModule):
         
         #---->Metrics
         if self.n_classes > 2: 
-            self.AUROC = torchmetrics.AUROC(num_classes = self.n_classes, average = 'macro')
-            metrics = torchmetrics.MetricCollection([torchmetrics.Accuracy(num_classes = self.n_classes,
-                                                                           average='micro'),
-                                                     torchmetrics.CohenKappa(num_classes = self.n_classes),
-                                                     torchmetrics.F1(num_classes = self.n_classes,
-                                                                     average = 'macro'),
-                                                     torchmetrics.Recall(average = 'macro',
-                                                                         num_classes = self.n_classes),
-                                                     torchmetrics.Precision(average = 'macro',
-                                                                            num_classes = self.n_classes),
-                                                     torchmetrics.Specificity(average = 'macro',
-                                                                            num_classes = self.n_classes)])
+            self.AUROC = torchmetrics.AUROC(task="multiclass", num_classes=2, average="macro")
+            metrics = torchmetrics.MetricCollection([torchmetrics.Accuracy(task="multiclass", num_classes = self.n_classes, average='micro'),
+                                                     torchmetrics.CohenKappa(task="multiclass", num_classes = self.n_classes),
+                                                     torchmetrics.F1Score(task="multiclass", num_classes=2, average="macro"),
+                                                     torchmetrics.Recall(task="multiclass", average = 'macro', num_classes = self.n_classes),
+                                                     torchmetrics.Precision(task="multiclass", average = 'macro', num_classes = self.n_classes),
+                                                     torchmetrics.Specificity(task="multiclass", average = 'macro', num_classes = self.n_classes)])
         else : 
-            self.AUROC = torchmetrics.AUROC(num_classes=2, average = 'macro')
-            metrics = torchmetrics.MetricCollection([torchmetrics.Accuracy(num_classes = 2,
-                                                                           average = 'micro'),
-                                                     torchmetrics.CohenKappa(num_classes = 2),
-                                                     torchmetrics.F1(num_classes = 2,
-                                                                     average = 'macro'),
-                                                     torchmetrics.Recall(average = 'macro',
-                                                                         num_classes = 2),
-                                                     torchmetrics.Precision(average = 'macro',
-                                                                            num_classes = 2)])
+            self.AUROC = torchmetrics.AUROC(task="multiclass", num_classes=2, average="macro")
+            metrics = torchmetrics.MetricCollection([torchmetrics.Accuracy(task="multiclass", num_classes = 2, average = 'micro'),
+                                                     torchmetrics.CohenKappa(task="multiclass", num_classes = 2),
+                                                     torchmetrics.F1Score(task="multiclass", num_classes=2, average="macro"),
+                                                     torchmetrics.Recall(task="multiclass", average = 'macro', num_classes = 2),
+                                                     torchmetrics.Precision(task="multiclass", average = 'macro', num_classes = 2)])
         self.valid_metrics = metrics.clone(prefix = 'val_')
         self.test_metrics = metrics.clone(prefix = 'test_')
 
@@ -129,9 +120,13 @@ class  ModelInterface(pl.LightningModule):
         
         #---->
         self.log('val_loss', cross_entropy_torch(logits, target), prog_bar=True, on_epoch=True, logger=True)
-        self.log('auc', self.AUROC(probs, target.squeeze()), prog_bar=True, on_epoch=True, logger=True)
-        self.log_dict(self.valid_metrics(max_probs.squeeze() , target.squeeze()),
-                          on_epoch = True, logger = True)
+        self.log('auc', self.AUROC(probs, target.view(-1)), prog_bar=True, on_epoch=True, logger=True)
+        self.log_dict(
+            self.valid_metrics(max_probs, target),
+            prog_bar=True,
+            on_epoch=True,
+            logger=True
+        )
 
         #---->acc log
         for c in range(self.n_classes):
@@ -170,35 +165,44 @@ class  ModelInterface(pl.LightningModule):
         return {'logits' : logits, 'Y_prob' : Y_prob, 'Y_hat' : Y_hat, 'label' : label}
 
     def test_epoch_end(self, output_results):
-        probs = torch.cat([x['Y_prob'] for x in output_results], dim = 0)
-        max_probs = torch.stack([x['Y_hat'] for x in output_results])
-        target = torch.stack([x['label'] for x in output_results], dim = 0)
-        
-        #---->
-        auc = self.AUROC(probs, target.squeeze())
-        metrics = self.test_metrics(max_probs.squeeze() , target.squeeze())
+        probs = torch.cat([x['Y_prob'] for x in output_results], dim=0)      # [N, C]
+        max_probs = torch.cat([x['Y_hat'] for x in output_results], dim=0)   # [N]
+        target = torch.cat([x['label'] for x in output_results], dim=0)      # [N] or close
+
+        # normalize shapes explicitly
+        probs = probs.view(-1, self.n_classes)
+        max_probs = max_probs.view(-1).long()
+        target = target.view(-1).long()
+
+        # metrics
+        auc = self.AUROC(probs, target)
+        metrics = self.test_metrics(max_probs, target)
         metrics['auc'] = auc
+
         for keys, values in metrics.items():
             print(f'{keys} = {values}')
-            metrics[keys] = values.cpu().numpy()
+            metrics[keys] = values.detach().cpu().numpy()
+
         print()
-        #---->acc log
+
+        # per-class acc log
         for c in range(self.n_classes):
             count = self.data[c]["count"]
             correct = self.data[c]["correct"]
-            if count == 0: 
+            if count == 0:
                 acc = None
             else:
                 acc = float(correct) / count
             print('class {}: acc {}, correct {}/{}'.format(c, acc, correct, count))
+
         self.data = [{"count": 0, "correct": 0} for i in range(self.n_classes)]
-        #---->
+
         result = pd.DataFrame([metrics])
-        result.to_csv(self.log_path / 'result.csv')
+        result.to_csv(self.log_path / 'result.csv', index=False)
 
 
     def load_model(self):
-        name = self.hparams.model.name
+        name = self.model_cfg.name
         # Change the `trans_unet.py` file name to `TransUnet` class name.
         # Please always name your model file name as `trans_unet.py` and
         # class name or funciton name corresponding `TransUnet`.
@@ -220,10 +224,10 @@ class  ModelInterface(pl.LightningModule):
             to overwrite the corresponding value in self.hparams.
         """
         class_args = inspect.getargspec(Model.__init__).args[1:]
-        inkeys = self.hparams.model.keys()
+        inkeys = self.model_cfg.keys()
         args1 = {}
         for arg in class_args:
             if arg in inkeys:
-                args1[arg] = getattr(self.hparams.model, arg)
+                args1[arg] = getattr(self.model_cfg, arg)
         args1.update(other_args)
         return Model(**args1)
